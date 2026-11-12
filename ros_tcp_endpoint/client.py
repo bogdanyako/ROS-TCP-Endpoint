@@ -188,23 +188,20 @@ class ClientThread(threading.Thread):
         """
         self.tcp_server.loginfo("Connection from {}".format(self.incoming_ip))
         halt_event = threading.Event()
-        self.tcp_server.unity_tcp_sender.start_sender(self.conn, halt_event)
+        sender = self.tcp_server.unity_tcp_sender
         try:
+            sender.start_sender(self.conn, halt_event)
             while not halt_event.is_set():
                 destination, data = self.read_message(self.conn)
 
-                # Process this message that was sent from Unity
-                if self.tcp_server.pending_srv_id is not None:
-                    # if we've been told that the next message will be a service request/response, process it as such
-                    if self.tcp_server.pending_srv_is_request:
-                        self.send_ros_service_request(
-                            self.tcp_server.pending_srv_id, destination, data
-                        )
+                if destination in ("__request", "__response"):
+                    # The next frame on this socket contains the service payload.
+                    srv_id = json.loads(data.decode("utf-8").rstrip("\x00"))["srv_id"]
+                    payload_topic, payload = self.read_message(self.conn)
+                    if destination == "__request":
+                        self.send_ros_service_request(srv_id, payload_topic, payload)
                     else:
-                        self.tcp_server.send_unity_service_response(
-                            self.tcp_server.pending_srv_id, data
-                        )
-                    self.tcp_server.pending_srv_id = None
+                        sender.send_unity_service_response(self.conn, srv_id, payload)
                 elif destination == "":
                     # ignore this keepalive message, listen for more
                     pass
@@ -224,5 +221,6 @@ class ClientThread(threading.Thread):
             self.tcp_server.logerr("Exception: {}".format(e))
         finally:
             halt_event.set()
+            sender.stop_sender(self.conn)
             self.conn.close()
             self.tcp_server.loginfo("Disconnected from {}".format(self.incoming_ip))

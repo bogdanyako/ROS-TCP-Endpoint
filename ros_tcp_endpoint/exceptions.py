@@ -21,3 +21,7 @@ class RosTcpEndpointError(Exception):
 class TopicOrServiceNameDoesNotExistError(RosTcpEndpointError):
     """The topic or service name passed does not exist in the source destination dictionary."""
     pass
+
+
+class UnityServiceCallError(RosTcpEndpointError):
+    """A request could not get a response from the Unity connection."""

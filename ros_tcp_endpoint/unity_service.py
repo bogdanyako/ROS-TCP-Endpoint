@@ -12,12 +12,10 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-import rclpy
-import socket
 import re
 
 from .communication import RosReceiver
-from .client import ClientThread
+from .exceptions import UnityServiceCallError
 
 
 class UnityService(RosReceiver):
@@ -46,15 +44,18 @@ class UnityService(RosReceiver):
         self.service = self.create_service(self.service_class, self.topic, self.send)
 
     def send(self, request, response):
-        """
-        Connect to TCP endpoint on client, pass along message and get reply
-        Args:
-            data: message data to send outside of ROS network
-
-        Returns:
-            The response message
-        """
-        return self.tcp_server.send_unity_service(self.topic, self.service_class, request)
+        """Forward a request and return a valid ROS response if Unity is unavailable."""
+        try:
+            return self.tcp_server.send_unity_service(self.topic, self.service_class, request)
+        except UnityServiceCallError as error:
+            message = f"{self.topic}: {error}"
+            self.tcp_server.logwarn(message)
+            # Services such as CaptureImage expose their own failure fields.
+            if isinstance(getattr(response, "success", None), bool):
+                response.success = False
+                if isinstance(getattr(response, "message", None), str):
+                    response.message = message
+            return response
 
     def unregister(self):
         """

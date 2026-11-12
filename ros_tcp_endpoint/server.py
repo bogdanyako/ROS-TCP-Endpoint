@@ -50,6 +50,7 @@ class TcpServer(Node):
 
         self.declare_parameter("ROS_IP", "0.0.0.0")
         self.declare_parameter("ROS_TCP_PORT", 10000)
+        service_timeout = self.declare_parameter("UNITY_SERVICE_TIMEOUT_SECONDS", 5.0)
 
         if tcp_ip:
             self.loginfo("Using ROS_IP override from constructor: {}".format(tcp_ip))
@@ -63,7 +64,7 @@ class TcpServer(Node):
         else:
             self.tcp_port = self.get_parameter("ROS_TCP_PORT").get_parameter_value().integer_value
 
-        self.unity_tcp_sender = UnityTcpSender(self)
+        self.unity_tcp_sender = UnityTcpSender(self, service_timeout.value)
 
         self.node_name = node_name
         self.publishers_table = {}
@@ -73,8 +74,6 @@ class TcpServer(Node):
         self.buffer_size = buffer_size
         self.connections = connections
         self.syscommands = SysCommands(self)
-        self.pending_srv_id = None
-        self.pending_srv_is_request = False
 
     def start(self, publishers=None, subscribers=None):
         if publishers is not None:
@@ -113,9 +112,6 @@ class TcpServer(Node):
 
     def send_unity_service(self, topic, service_class, request):
         return self.unity_tcp_sender.send_unity_service_request(topic, service_class, request)
-
-    def send_unity_service_response(self, srv_id, data):
-        self.unity_tcp_sender.send_unity_service_response(srv_id, data)
 
     def handle_syscommand(self, topic, data):
         function = getattr(self.syscommands, topic[2:])
@@ -192,6 +188,8 @@ class SysCommands:
     def __init__(self, tcp_server):
         self.tcp_server = tcp_server
 
+    # Unity can repeat registrations at startup and on reconnect. Keep matching
+    # ROS entities alive so the executor can safely finish work already queued.
     def subscribe(self, topic, message_name):
         if topic == "":
             self.tcp_server.send_unity_error(
@@ -210,6 +208,8 @@ class SysCommands:
 
         old_node = self.tcp_server.subscribers_table.get(topic)
         if old_node is not None:
+            if old_node.msg is message_class:
+                return
             self.tcp_server.unregister_node(old_node)
 
         new_subscriber = RosSubscriber(topic, message_class, self.tcp_server)
@@ -237,6 +237,8 @@ class SysCommands:
 
         old_node = self.tcp_server.publishers_table.get(topic)
         if old_node is not None:
+            if type(old_node.msg) is message_class and old_node.queue_size == queue_size:
+                return
             self.tcp_server.unregister_node(old_node)
 
         new_publisher = RosPublisher(topic, message_class, queue_size=queue_size, latch=latch)
@@ -296,6 +298,11 @@ class SysCommands:
 
         old_node = self.tcp_server.unity_services_table.get(topic)
         if old_node is not None:
+            if old_node.service_class is message_class:
+                self.tcp_server.loginfo(
+                    "RegisterUnityService({}, {}) reused".format(topic, message_class)
+                )
+                return
             self.tcp_server.unregister_node(old_node)
 
         new_service = UnityService(str(topic), message_class, self.tcp_server)
@@ -305,14 +312,6 @@ class SysCommands:
             self.tcp_server.executor.add_node(new_service)
 
         self.tcp_server.loginfo("RegisterUnityService({}, {}) OK".format(topic, message_class))
-
-    def response(self, srv_id):  # the next message is a service response
-        self.tcp_server.pending_srv_id = srv_id
-        self.tcp_server.pending_srv_is_request = False
-
-    def request(self, srv_id):  # the next message is a service request
-        self.tcp_server.pending_srv_id = srv_id
-        self.tcp_server.pending_srv_is_request = True
 
     def topic_list(self):
         self.tcp_server.unity_tcp_sender.send_topic_list()
