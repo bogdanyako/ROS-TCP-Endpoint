@@ -14,6 +14,7 @@
 
 import rclpy
 import re
+from threading import Event
 
 from rclpy.serialization import deserialize_message
 
@@ -37,9 +38,9 @@ class RosService(RosSender):
 
         self.service_topic = service
         self.cli = self.create_client(service_class, service)
-        self.req = service_class.Request()
+        self.service_class = service_class
 
-    def send(self, data):
+    def send(self, data, halt_event):
         """
         Takes in serialized message data from source outside of the ROS network,
         deserializes it into it's class, calls the service with the message, and returns
@@ -47,12 +48,12 @@ class RosService(RosSender):
 
         Args:
             data: The already serialized message_class data coming from outside of ROS
+            halt_event: Signals that the requesting Unity connection closed
 
         Returns:
             service response
         """
-        message_type = type(self.req)
-        message = deserialize_message(data, message_type)
+        message = deserialize_message(data, self.service_class.Request)
 
         if not self.cli.service_is_ready():
             self.get_logger().error(
@@ -60,18 +61,21 @@ class RosService(RosSender):
             )
             return None
 
-        self.future = self.cli.call_async(message)
-
-        while rclpy.ok():
-            if self.future.done():
+        if halt_event.is_set():
+            return None
+        future = self.cli.call_async(message)
+        completed = Event()
+        future.add_done_callback(lambda _: completed.set())
+        while not halt_event.is_set() and rclpy.ok():
+            if completed.wait(0.05):
                 try:
-                    response = self.future.result()
-                    return response
-                except Exception as e:
-                    self.get_logger().info(f"Service call failed {e}")
+                    return future.result()
+                except Exception as error:
+                    self.get_logger().info(f"Service call failed {error}")
+                    return None
 
-                break
-
+        self.cli.remove_pending_request(future)
+        future.cancel()
         return None
 
     def unregister(self):

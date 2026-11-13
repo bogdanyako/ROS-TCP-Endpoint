@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from unittest import TestCase, mock
 
 from ros_tcp_endpoint.client import ClientThread
+from ros_tcp_endpoint.service import RosService
 from ros_tcp_endpoint.tcp_sender import UnityTcpSender
 from ros_tcp_endpoint.unity_service import UnityService
 
@@ -34,7 +35,6 @@ class TestUnityServiceRoundTrip(TestCase):
         self.addCleanup(stack.close)
         self.server = mock.Mock()
         self.sender = UnityTcpSender(self.server, service_timeout_seconds=2.0)
-        self.sender.time_between_halt_checks = 0.05
         self.server.unity_tcp_sender = self.sender
         self.server.send_unity_service = self.sender.send_unity_service_request
         self.service = SimpleNamespace(
@@ -49,13 +49,19 @@ class TestUnityServiceRoundTrip(TestCase):
             mock.patch("ros_tcp_endpoint.tcp_sender.deserialize_message", return_value=self.response)
         )
 
-    def connect(self):
+    def connect(self, receive_timeout=None, accepted=True):
         """Start the endpoint reader and return the Unity end of its socket."""
         endpoint, peer = socket.socketpair()
+        endpoint.settimeout(receive_timeout)
         peer.settimeout(1.0)
         client = ClientThread(endpoint, self.server, "test", 0)
-        client.daemon = True
-        client.start()
+
+        if not accepted:
+            self.addCleanup(peer.close)
+            self.assertFalse(client.start_client())
+            self.assertEqual(peer.recv(1), b"")
+            return
+        self.assertTrue(client.start_client())
 
         def disconnect():
             peer.close()
@@ -140,21 +146,76 @@ class TestUnityServiceRoundTrip(TestCase):
         self.send_reply(unity, srv_id)
         self.assertIs(call.result(timeout=1.0), self.response)
 
-    def test_old_connection_cannot_complete_or_cancel_new_request(self):
-        """An overlapping reconnect owns its own pending service requests."""
-        old_unity, old_client = self.connect()
-        old_call, _ = self.request(old_unity)
+    def test_overlapping_connection_does_not_interrupt_capture(self):
+        """The second socket is closed before it can disturb a pending service."""
         unity, _ = self.connect()
-        self.assertIn("disconnected", old_call.result(timeout=1.0).message)
-
         call, srv_id = self.request(unity)
-        self.send_reply(old_unity, srv_id)
-        old_unity.conn.close()
-        old_client.join(timeout=1.0)
-        self.assertFalse(old_client.is_alive())
+        self.send_reply(unity, srv_id, include_payload=False)
+        self.connect(accepted=False)
         self.assertFalse(call.done())
+        unity.conn.sendall(ClientThread.serialize_message(self.service.topic, b"image"))
+        self.assertIs(call.result(timeout=1.0), self.response)
+
+    def test_silent_connection_times_out_and_releases_slot(self):
+        """Even without EOF, an idle or stalled socket releases the endpoint."""
+        unity, client = self.connect(receive_timeout=0.2)
+        call, _ = self.request(unity)
+        self.assertIn("disconnected", call.result(timeout=1.0).message)
+        client.join(timeout=1.0)
+        self.assertFalse(client.is_alive())
+
+        unity, _ = self.connect()
+        call, srv_id = self.request(unity)
         self.send_reply(unity, srv_id)
         self.assertIs(call.result(timeout=1.0), self.response)
+
+    def test_write_failure_wakes_reader_and_releases_slot(self):
+        """A writer failure closes the connection even while its reader is blocked."""
+        unity, client = self.connect()
+        unity.conn.shutdown(socket.SHUT_RD)
+        call = self.calls.submit(
+            UnityService.send, self.service, b"capture", SimpleNamespace(success=False, message="")
+        )
+        self.assertIn("disconnected", call.result(timeout=1.0).message)
+        client.join(timeout=1.0)
+        self.assertFalse(client.is_alive())
+        self.connect()
+
+    def test_old_ros_response_cannot_reach_replacement_socket(self):
+        """A response in flight from the first session cannot cross into the next."""
+        old_unity, old_client = self.connect()
+        serialize = ClientThread.serialize_message
+        serializing = Event()
+        release = Event()
+
+        def delayed_serialize(topic, message):
+            if message == b"old":
+                serializing.set()
+                if not release.wait(timeout=1.0):
+                    raise AssertionError("Old response did not reach the reconnect")
+            return serialize(topic, message)
+
+        self.addCleanup(release.set)
+        with ThreadPoolExecutor() as workers, mock.patch.object(
+            ClientThread, "serialize_message", side_effect=delayed_serialize
+        ):
+            old_reply = workers.submit(
+                self.sender.send_ros_service_response, old_client.conn, 1, "/ros/service", b"old"
+            )
+            try:
+                self.assertTrue(serializing.wait(timeout=1.0))
+                old_unity.conn.close()
+                old_client.join(timeout=1.0)
+                self.assertFalse(old_client.is_alive())
+                unity, client = self.connect()
+            finally:
+                release.set()
+            old_reply.result(timeout=1.0)
+            self.sender.send_ros_service_response(client.conn, 1, "/ros/service", b"new")
+            command, header = unity.read_message(unity.conn)
+            self.assertEqual(command, "__response")
+            self.assertEqual(json.loads(header)["srv_id"], 1)
+            self.assertEqual(unity.read_message(unity.conn), ("/ros/service", b"new"))
 
     def test_unavailable_connection_returns_a_ros_response(self):
         """Calling while disconnected returns the service's failure response."""
@@ -163,3 +224,43 @@ class TestUnityServiceRoundTrip(TestCase):
         )
         self.assertFalse(response.success)
         self.assertIn("disconnected", response.message)
+
+
+class TestRosServiceRequests(TestCase):
+    """Exercise the ROS client futures associated with Unity requests."""
+
+    def test_concurrent_calls_keep_their_own_ros_responses(self):
+        """Reply in reverse order and deliver the result to each requesting worker."""
+        ros_client = mock.Mock()
+        futures = {b"first": Future(), b"second": Future()}
+        started = {data: Event() for data in futures}
+
+        def call_async(data):
+            started[data].set()
+            return futures[data]
+
+        ros_client.call_async.side_effect = call_async
+        service = SimpleNamespace(
+            cli=ros_client,
+            service_class=SimpleNamespace(Request=object),
+        )
+        disconnected = Event()
+        with (
+            mock.patch("ros_tcp_endpoint.service.rclpy.ok", return_value=True),
+            mock.patch(
+                "ros_tcp_endpoint.service.deserialize_message", side_effect=lambda data, _: data
+            ),
+            ThreadPoolExecutor(max_workers=2) as workers,
+        ):
+            first = workers.submit(RosService.send, service, b"first", disconnected)
+            second = workers.submit(RosService.send, service, b"second", disconnected)
+            try:
+                self.assertTrue(started[b"first"].wait(1.0))
+                self.assertTrue(started[b"second"].wait(1.0))
+                futures[b"second"].set_result(b"second response")
+                self.assertEqual(second.result(timeout=1.0), b"second response")
+                self.assertFalse(first.done())
+                futures[b"first"].set_result(b"first response")
+                self.assertEqual(first.result(timeout=1.0), b"first response")
+            finally:
+                disconnected.set()

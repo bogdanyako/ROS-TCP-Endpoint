@@ -14,9 +14,10 @@
 
 import json
 import math
+import socket
 import threading
 from concurrent.futures import CancelledError, Future, TimeoutError
-from queue import Empty, Queue
+from queue import Queue
 
 from rclpy.serialization import deserialize_message
 
@@ -33,7 +34,6 @@ class UnityTcpSender:
         if not math.isfinite(service_timeout_seconds) or service_timeout_seconds <= 0:
             raise ValueError("UNITY_SERVICE_TIMEOUT_SECONDS must be finite and positive")
 
-        self.time_between_halt_checks = 5
         self.tcp_server = tcp_server
         self.service_timeout_seconds = service_timeout_seconds
 
@@ -61,22 +61,22 @@ class UnityTcpSender:
             serialized_bytes = ClientThread.serialize_command("__warn", command)
             queue.put(serialized_bytes)
 
-    def send_unity_error(self, text):
-        queue = self.queue
-        if queue is not None:
-            command = SysCommand_Log()
-            command.text = text
-            serialized_bytes = ClientThread.serialize_command("__error", command)
-            queue.put(serialized_bytes)
+    def send_unity_error(self, text, conn=None):
+        command = SysCommand_Log()
+        command.text = text
+        frame = ClientThread.serialize_command("__error", command)
+        with self.queue_lock:
+            if self.queue is not None and (conn is None or conn is self.connection):
+                self.queue.put(frame)
 
-    def send_ros_service_response(self, srv_id, destination, response):
-        queue = self.queue
-        if queue is not None:
-            command = SysCommand_Service()
-            command.srv_id = srv_id
-            serialized_header = ClientThread.serialize_command("__response", command)
-            serialized_message = ClientThread.serialize_message(destination, response)
-            queue.put(b"".join([serialized_header, serialized_message]))
+    def send_ros_service_response(self, conn, srv_id, destination, response):
+        command = SysCommand_Service()
+        command.srv_id = srv_id
+        header = ClientThread.serialize_command("__response", command)
+        payload = ClientThread.serialize_message(destination, response)
+        with self.queue_lock:
+            if conn is self.connection and self.queue is not None:
+                self.queue.put(header + payload)
 
     def send_unity_message(self, topic, message):
         queue = self.queue
@@ -156,29 +156,30 @@ class UnityTcpSender:
             serialized_bytes = ClientThread.serialize_command("__topic_list", topic_list)
             queue.put(serialized_bytes)
 
-    def start_sender(self, conn, halt_event):
-        local_queue = Queue()
-
-        # send a handshake message to confirm the connection and version number
-        handshake_metadata = SysCommand_Handshake_Metadata()
-        handshake = SysCommand_Handshake(handshake_metadata)
-        local_queue.put(ClientThread.serialize_command("__handshake", handshake))
-
+    def claim_connection(self, conn):
         with self.queue_lock:
-            self._cancel_pending_services()
+            if self.connection is not None:
+                return None
+
+            local_queue = Queue()
+            handshake = SysCommand_Handshake(SysCommand_Handshake_Metadata())
+            local_queue.put(ClientThread.serialize_command("__handshake", handshake))
             self.connection = conn
             self.queue = local_queue
+            return local_queue
 
-        threading.Thread(
-            target=self.sender_loop, args=(conn, halt_event, local_queue), daemon=True
-        ).start()
+    def stop_sending(self, conn):
+        with self.queue_lock:
+            if conn is self.connection:
+                if self.queue is not None:
+                    self.queue.put(None)
+                self.queue = None
+                self._cancel_pending_services()
 
-    def stop_sender(self, conn):
+    def release_connection(self, conn):
         with self.queue_lock:
             if conn is self.connection:
                 self.connection = None
-                self.queue = None
-                self._cancel_pending_services()
 
     def _cancel_pending_services(self):
         for response in self.services_waiting.values():
@@ -188,21 +189,19 @@ class UnityTcpSender:
     def sender_loop(self, conn, halt_event, local_queue):
         try:
             while not halt_event.is_set():
-                try:
-                    item = local_queue.get(timeout=self.time_between_halt_checks)
-                except Empty:
-                    # I'd like to just wait on the queue, but we also need to check occasionally for the connection being closed
-                    # (otherwise the thread never terminates.)
-                    continue
-
-                try:
-                    conn.sendall(item)
-                except Exception as e:
-                    self.tcp_server.logerr("Exception {}".format(e))
+                item = local_queue.get()
+                if item is None or halt_event.is_set():
                     break
-        finally:
-            halt_event.set()
-            self.stop_sender(conn)
+                conn.sendall(item)
+        except OSError as error:
+            if not halt_event.is_set():
+                self.tcp_server.logwarn(f"Unity socket write failed: {error}")
+                halt_event.set()
+                self.stop_sending(conn)
+                try:
+                    conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
 
     def parse_message_name(self, name):
         try:

@@ -8,6 +8,13 @@
 
 Instructions and examples on how to use this ROS package can be found on the [Unity Robotics Hub](https://github.com/Unity-Technologies/Unity-Robotics-Hub/blob/master/tutorials/ros_unity_integration/README.md) repository.
 
+## Unity connections
+
+Each endpoint accepts one Unity client at a time. Additional clients are rejected
+until the active socket closes or stops sending data. The ROS parameter
+`UNITY_RECEIVE_TIMEOUT_SECONDS` defaults to 5 seconds. Set it above the Unity
+connector's keepalive interval and allow time for network delays.
+
 ## Community and Feedback
 
 The Unity Robotics projects are open-source and we encourage and welcome contributions.

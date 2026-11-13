@@ -17,6 +17,7 @@ import struct
 
 import threading
 import json
+import socket
 
 from rclpy.serialization import deserialize_message
 from rclpy.serialization import serialize_message
@@ -43,7 +44,28 @@ class ClientThread(threading.Thread):
         self.tcp_server = tcp_server
         self.incoming_ip = incoming_ip
         self.incoming_port = incoming_port
-        threading.Thread.__init__(self)
+        self.halt_event = threading.Event()
+        super().__init__(daemon=True)
+
+    def start_client(self):
+        sender = self.tcp_server.unity_tcp_sender
+        self.outgoing_queue = sender.claim_connection(self.conn)
+        if self.outgoing_queue is None:
+            self.conn.close()
+            self.tcp_server.logwarn(
+                f"Rejected Unity connection from {self.incoming_ip}:{self.incoming_port}. "
+                "Another Unity client is active."
+            )
+            return False
+
+        try:
+            self.start()
+        except RuntimeError:
+            sender.stop_sending(self.conn)
+            self.conn.close()
+            sender.release_connection(self.conn)
+            raise
+        return True
 
     @staticmethod
     def recvall(conn, size, flags=0):
@@ -160,16 +182,20 @@ class ClientThread(threading.Thread):
             service_thread.start()
 
     def service_call_thread(self, srv_id, destination, data, ros_communicator):
-        response = ros_communicator.send(data)
+        response = ros_communicator.send(data, self.halt_event)
+        if self.halt_event.is_set():
+            return
 
         if not response:
             error_msg = "No response data from service '{}'!".format(destination)
-            self.tcp_server.send_unity_error(error_msg)
+            self.tcp_server.unity_tcp_sender.send_unity_error(error_msg, conn=self.conn)
             self.tcp_server.logerr(error_msg)
             # TODO: send a response to Unity anyway?
             return
 
-        self.tcp_server.unity_tcp_sender.send_ros_service_response(srv_id, destination, response)
+        self.tcp_server.unity_tcp_sender.send_ros_service_response(
+            self.conn, srv_id, destination, response
+        )
 
     def run(self):
         """
@@ -186,18 +212,27 @@ class ClientThread(threading.Thread):
             msg: the ROS msg type as bytes
 
         """
-        self.tcp_server.loginfo("Connection from {}".format(self.incoming_ip))
-        halt_event = threading.Event()
+        peer = f"{self.incoming_ip}:{self.incoming_port}"
+        self.tcp_server.loginfo(f"Connection from {peer}")
         sender = self.tcp_server.unity_tcp_sender
+        writer = threading.Thread(
+            target=sender.sender_loop,
+            args=(self.conn, self.halt_event, self.outgoing_queue),
+            daemon=True,
+        )
         try:
-            sender.start_sender(self.conn, halt_event)
-            while not halt_event.is_set():
+            writer.start()
+            while not self.halt_event.is_set():
                 destination, data = self.read_message(self.conn)
+                if self.halt_event.is_set():
+                    break
 
                 if destination in ("__request", "__response"):
                     # The next frame on this socket contains the service payload.
                     srv_id = json.loads(data.decode("utf-8").rstrip("\x00"))["srv_id"]
                     payload_topic, payload = self.read_message(self.conn)
+                    if self.halt_event.is_set():
+                        break
                     if destination == "__request":
                         self.send_ros_service_request(srv_id, payload_topic, payload)
                     else:
@@ -217,10 +252,21 @@ class ClientThread(threading.Thread):
                     )
                     self.tcp_server.send_unity_error(error_msg)
                     self.tcp_server.logerr(error_msg)
-        except IOError as e:
-            self.tcp_server.logerr("Exception: {}".format(e))
+        except TimeoutError:
+            if not self.halt_event.is_set():
+                self.tcp_server.logwarn(f"Unity connection from {peer} timed out receiving data.")
+        except OSError as error:
+            if not self.halt_event.is_set():
+                self.tcp_server.loginfo(f"Unity socket from {peer} closed: {error}")
         finally:
-            halt_event.set()
-            sender.stop_sender(self.conn)
+            self.halt_event.set()
+            sender.stop_sending(self.conn)
+            try:
+                self.conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            if writer.ident is not None:
+                writer.join()
             self.conn.close()
-            self.tcp_server.loginfo("Disconnected from {}".format(self.incoming_ip))
+            sender.release_connection(self.conn)
+            self.tcp_server.loginfo(f"Disconnected from {peer}")

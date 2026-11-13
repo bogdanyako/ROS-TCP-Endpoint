@@ -18,6 +18,7 @@ import json
 import sys
 import threading
 import importlib
+import math
 
 from rclpy.node import Node
 from rclpy.parameter import Parameter
@@ -51,6 +52,10 @@ class TcpServer(Node):
         self.declare_parameter("ROS_IP", "0.0.0.0")
         self.declare_parameter("ROS_TCP_PORT", 10000)
         service_timeout = self.declare_parameter("UNITY_SERVICE_TIMEOUT_SECONDS", 5.0)
+        receive_timeout = self.declare_parameter("UNITY_RECEIVE_TIMEOUT_SECONDS", 5.0)
+        self.receive_timeout = receive_timeout.value
+        if not math.isfinite(self.receive_timeout) or self.receive_timeout <= 0:
+            raise ValueError("UNITY_RECEIVE_TIMEOUT_SECONDS must be finite and positive")
 
         if tcp_ip:
             self.loginfo("Using ROS_IP override from constructor: {}".format(tcp_ip))
@@ -74,6 +79,7 @@ class TcpServer(Node):
         self.buffer_size = buffer_size
         self.connections = connections
         self.syscommands = SysCommands(self)
+        self.executor = None
 
     def start(self, publishers=None, subscribers=None):
         if publishers is not None:
@@ -94,14 +100,14 @@ class TcpServer(Node):
         tcp_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         tcp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         tcp_server.bind((self.tcp_ip, self.tcp_port))
+        tcp_server.listen(self.connections)
 
         while True:
-            tcp_server.listen(self.connections)
-
             try:
                 (conn, (ip, port)) = tcp_server.accept()
-                ClientThread(conn, self, ip, port).start()
-            except socket.timeout as err:
+                conn.settimeout(self.receive_timeout)
+                ClientThread(conn, self, ip, port).start_client()
+            except socket.timeout:
                 self.logerr("ros_tcp_endpoint.TcpServer: socket timeout")
 
     def send_unity_error(self, error):
@@ -268,6 +274,8 @@ class SysCommands:
 
         old_node = self.tcp_server.ros_services_table.get(topic)
         if old_node is not None:
+            if old_node.service_class is message_class:
+                return
             self.tcp_server.unregister_node(old_node)
 
         new_service = RosService(topic, message_class)
