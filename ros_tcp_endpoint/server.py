@@ -25,7 +25,12 @@ from rclpy.parameter import Parameter
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.serialization import deserialize_message
 
-from .tcp_sender import UnityTcpSender
+from .tcp_sender import (
+    DEFAULT_MAX_QUEUED_BYTES,
+    DEFAULT_MAX_QUEUED_MESSAGES,
+    DEFAULT_REPLACEABLE_TOPICS,
+    UnityTcpSender,
+)
 from .client import ClientThread
 from .subscriber import RosSubscriber
 from .publisher import RosPublisher
@@ -69,7 +74,18 @@ class TcpServer(Node):
         else:
             self.tcp_port = self.get_parameter("ROS_TCP_PORT").get_parameter_value().integer_value
 
-        self.unity_tcp_sender = UnityTcpSender(self, service_timeout.value)
+        queue_messages = self.declare_parameter(
+            "UNITY_OUTGOING_MAX_MESSAGES", DEFAULT_MAX_QUEUED_MESSAGES
+        ).value
+        queue_bytes = self.declare_parameter(
+            "UNITY_OUTGOING_MAX_BYTES", DEFAULT_MAX_QUEUED_BYTES
+        ).value
+        replaceable_topics = self.declare_parameter(
+            "UNITY_REPLACEABLE_TOPICS", list(DEFAULT_REPLACEABLE_TOPICS)
+        ).get_parameter_value().string_array_value
+        self.unity_tcp_sender = UnityTcpSender(
+            self, service_timeout.value, queue_messages, queue_bytes, replaceable_topics
+        )
 
         self.node_name = node_name
         self.publishers_table = {}

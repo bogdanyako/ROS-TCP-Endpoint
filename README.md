@@ -15,6 +15,24 @@ until the active socket closes or stops sending data. The ROS parameter
 `UNITY_RECEIVE_TIMEOUT_SECONDS` defaults to 5 seconds. Set it above the Unity
 connector's keepalive interval and allow time for network delays.
 
+### Outgoing buffering
+
+The endpoint queues up to 128 waiting messages and 16 MiB per connection by
+default. Set `UNITY_OUTGOING_MAX_MESSAGES` and `UNITY_OUTGOING_MAX_BYTES` to
+override these limits. The socket buffers and the one message currently being
+sent are separate from the waiting queue.
+
+`UNITY_REPLACEABLE_TOPICS` lists the topics whose newest waiting message replaces
+the previous one. It defaults to `/ros2_control/joint_states`. Only list topics
+where each message is a complete state snapshot. Other traffic is sent in order,
+with each service header and payload sent together.
+
+When the queue fills, the endpoint discards replaceable updates first. A new
+ROS-to-Unity service request that still cannot fit fails immediately. If an
+ordered command or reply cannot fit, the endpoint closes the connection and
+cancels pending Unity calls. Requests that expire before sending are discarded.
+The socket timeout also bounds write stalls.
+
 ## Community and Feedback
 
 The Unity Robotics projects are open-source and we encourage and welcome contributions.

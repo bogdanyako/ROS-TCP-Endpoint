@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from unittest import TestCase, mock
 
 from ros_tcp_endpoint.client import ClientThread
+from ros_tcp_endpoint.outgoing_queue import OutgoingFrame, OutgoingQueue
 from ros_tcp_endpoint.service import RosService
 from ros_tcp_endpoint.tcp_sender import UnityTcpSender
 from ros_tcp_endpoint.unity_service import UnityService
@@ -224,6 +225,85 @@ class TestUnityServiceRoundTrip(TestCase):
         )
         self.assertFalse(response.success)
         self.assertIn("disconnected", response.message)
+
+    def test_timed_out_waiting_request_is_removed_before_send(self):
+        """An expired ROS request cannot execute when the writer drains later."""
+        endpoint, unity = socket.socketpair()
+        self.addCleanup(endpoint.close)
+        self.addCleanup(unity.close)
+        queue = self.sender.claim_connection(endpoint)
+        queue.get()  # Handshake
+        self.sender.service_timeout_seconds = 0.05
+        response = UnityService.send(
+            self.service, b"capture", SimpleNamespace(success=False, message="")
+        )
+        self.assertIn("did not respond", response.message)
+        self.sender.send_unity_message("/command", b"still ordered")
+        frame = queue.get()
+        self.assertEqual(frame.data, ClientThread.serialize_message("/command", b"still ordered"))
+        self.assertEqual(queue.queued_bytes, 0)
+        self.assertFalse(self.sender.services_waiting)
+
+    def test_full_reliable_queue_rejects_request_then_disconnects_on_command(self):
+        """Service admission fails explicitly, and command overflow closes the session."""
+        endpoint, unity = socket.socketpair()
+        self.addCleanup(endpoint.close)
+        self.addCleanup(unity.close)
+        unity.settimeout(1.0)
+        self.sender.max_queued_messages = 1
+        queue = self.sender.claim_connection(endpoint)
+        queue.get()
+        self.sender.send_unity_message("/command", b"first")
+        response = UnityService.send(
+            self.service, b"capture", SimpleNamespace(success=False, message="")
+        )
+        self.assertIn("outgoing queue is full", response.message)
+        self.assertFalse(self.sender.services_waiting)
+
+        self.sender.send_unity_message("/command", b"second")
+        self.assertEqual(unity.recv(1), b"")
+        self.assertIsNone(queue.get())
+        self.assertEqual(queue.queued_bytes, 0)
+
+
+class TestOutgoingQueue(TestCase):
+    """Verify the traffic policy independent of the socket and ROS."""
+
+    def test_coalescing_keeps_command_order_and_newest_state(self):
+        """Replacing pending state leaves intervening commands ahead of it."""
+        queue = OutgoingQueue(max_items=3, max_bytes=32)
+        queue.put(OutgoingFrame(b"old", "/joints"))
+        queue.put(OutgoingFrame(b"cutter"))
+        queue.put(OutgoingFrame(b"latest", "/joints"))
+        queue.put(OutgoingFrame(b"gripper"))
+        self.assertEqual(len(queue.items), 3)
+        self.assertEqual(
+            [queue.get().data for _ in range(3)], [b"cutter", b"latest", b"gripper"]
+        )
+
+    def test_byte_and_item_limits_evict_only_replaceable_frames(self):
+        """Either limit can evict state while keeping reliable frames in order."""
+        queue = OutgoingQueue(max_items=3, max_bytes=10)
+        queue.put(OutgoingFrame(b"ooo", "/joints"))
+        queue.put(OutgoingFrame(b"ooo", "/other_state"))
+        queue.put(OutgoingFrame(b"first"))
+        queue.put(OutgoingFrame(b"new", "/joints"))
+        self.assertTrue(queue.put(OutgoingFrame(b"later")))
+        self.assertEqual(queue.queued_bytes, 10)
+        self.assertFalse(queue.put(OutgoingFrame(b"!")))
+        self.assertFalse(queue.put(OutgoingFrame(b"x" * 11, "/joints")))
+        self.assertEqual(len(queue.items), 2)
+        self.assertEqual([queue.get().data for _ in range(2)], [b"first", b"later"])
+
+    def test_message_limit_drops_waiting_state_under_pressure(self):
+        """A small frame count can fill the queue well before its byte limit."""
+        queue = OutgoingQueue(max_items=2, max_bytes=1024)
+        queue.put(OutgoingFrame(b"state", "/joints"))
+        queue.put(OutgoingFrame(b"first"))
+        self.assertTrue(queue.put(OutgoingFrame(b"second")))
+        self.assertFalse(queue.put(OutgoingFrame(b"third")))
+        self.assertEqual(len(queue.items), 2)
+        self.assertEqual([queue.get().data for _ in range(2)], [b"first", b"second"])
 
 
 class TestRosServiceRequests(TestCase):
